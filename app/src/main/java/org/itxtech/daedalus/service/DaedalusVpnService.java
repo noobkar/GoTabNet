@@ -402,9 +402,13 @@ public class DaedalusVpnService extends VpnService implements Runnable {
 
             InetAddress localServerAddress;
             try {
+                org.itxtech.daedalus.server.Logger.log("Attempting to resolve " + localDomain + " using system resolver.");
                 localServerAddress = MdnsResolver.systemResolve(localDomain);
+                org.itxtech.daedalus.server.Logger.log("Resolved " + localDomain + " to IP: " + localServerAddress.getHostAddress() + " using system resolver.");
             } catch (Exception e) {
+                org.itxtech.daedalus.server.Logger.log("System resolver failed. Attempting to resolve " + localDomain + " using mDNS.");
                 localServerAddress = MdnsResolver.resolveMdnsName(localDomain);
+                org.itxtech.daedalus.server.Logger.log("Resolved " + localDomain + " to IP: " + localServerAddress.getHostAddress() + " using mDNS.");
             }
 
             DnsMessage.Builder builder = dnsMessage.asBuilder();
@@ -414,13 +418,14 @@ public class DaedalusVpnService extends VpnService implements Runnable {
             byte[] response = builder.build().toArray();
 
             // Log the response being sent
-            org.itxtech.daedalus.server.Logger.log("Sending response: " + Arrays.toString(response));
+            org.itxtech.daedalus.server.Logger.log("Sending response for " + queryDomain + " with IP: " + localServerAddress.getHostAddress());
 
             provider.writePacket(response);
         } catch (Exception e) {
             Logger.logException(e);
         }
     }
+
 
     public void providerLoopCallback() {
         if (statisticQuery) {

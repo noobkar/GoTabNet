@@ -23,6 +23,7 @@ import org.itxtech.daedalus.activity.MainActivity;
 import org.itxtech.daedalus.provider.MdnsResolver;
 import org.itxtech.daedalus.provider.Provider;
 import org.itxtech.daedalus.provider.ProviderPicker;
+import org.itxtech.daedalus.provider.TrafficHandler;
 import org.itxtech.daedalus.receiver.StatusBarBroadcastReceiver;
 import org.itxtech.daedalus.server.AbstractDnsServer;
 import org.itxtech.daedalus.server.DnsServer;
@@ -33,11 +34,21 @@ import org.itxtech.daedalus.util.RuleResolver;
 import org.minidns.dnsmessage.DnsMessage;
 import org.minidns.record.A;
 import org.minidns.record.Record;
-
+import android.util.Log;
+import javax.jmdns.JmDNS;
+import javax.jmdns.ServiceEvent;
+import javax.jmdns.ServiceListener;
+import java.net.InetAddress;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.io.EOFException;
 import java.net.Inet4Address;
 import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -47,6 +58,7 @@ public class DaedalusVpnService extends VpnService implements Runnable {
     public static final String ACTION_DEACTIVATE = "org.itxtech.daedalus.service.DaedalusVpnService.ACTION_DEACTIVATE";
 
     private static final int NOTIFICATION_ACTIVATED = 0;
+    private TrafficHandler trafficHandler;
 
     private static final String TAG = "DaedalusVpnService";
     private static final String CHANNEL_ID = "daedalus_channel_1";
@@ -71,7 +83,7 @@ public class DaedalusVpnService extends VpnService implements Runnable {
     public HashMap<String, AbstractDnsServer> dnsServers;
     private static boolean activated = false;
     private static BroadcastReceiver receiver;
-
+    MDNSSetup mdnsSetup;
     public static boolean isActivated() {
         return activated;
     }
@@ -90,6 +102,10 @@ public class DaedalusVpnService extends VpnService implements Runnable {
                     updateUpstreamServers(context);
                 }
             }, new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION));
+           mdnsSetup=new MDNSSetup();
+            mdnsSetup.setupMDNS();
+            initTrafficHandler();
+
         }
     }
 
@@ -191,6 +207,7 @@ public class DaedalusVpnService extends VpnService implements Runnable {
             this.mThread = new Thread(this, "DaedalusVpn");
             this.running = true;
             this.mThread.start();
+
         }
     }
 
@@ -228,6 +245,14 @@ public class DaedalusVpnService extends VpnService implements Runnable {
                 NotificationManager notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
                 notificationManager.cancel(NOTIFICATION_ACTIVATED);
                 notification = null;
+            }
+            // Stop traffic handling
+            if (trafficHandler != null) {
+                trafficHandler.stopTrafficHandling();
+            }
+            if (mdnsSetup!=null)
+            {
+                mdnsSetup.shutdown();
             }
             dnsServers = null;
         } catch (Exception e) {
@@ -282,7 +307,13 @@ public class DaedalusVpnService extends VpnService implements Runnable {
         }
         return null;
     }
-
+    private void initTrafficHandler() {
+        if (trafficHandler == null) {
+            trafficHandler = new TrafficHandler();
+            // If TrafficHandler needs any configuration, do it here
+            // For example: trafficHandler.setLocalDomainMap(localDomainMap);
+        }
+    }
     @Override
     public void run() {
         try {
@@ -315,7 +346,7 @@ public class DaedalusVpnService extends VpnService implements Runnable {
             String format = null;
             for (String prefix : new String[]{"10.0.0", "192.0.2", "198.51.100", "203.0.113", "192.168.50"}) {
                 try {
-                    builder.addAddress(prefix + ".1", 24);
+                    builder.addAddress(prefix + ".1", 32);
                 } catch (IllegalArgumentException e) {
                     continue;
                 }
@@ -350,6 +381,9 @@ public class DaedalusVpnService extends VpnService implements Runnable {
 
             provider = ProviderPicker.getProvider(descriptor, this);
             provider.start();
+            initTrafficHandler();
+
+            trafficHandler.handleTraffic(descriptor.getFileDescriptor());
 
             while (running) {
                 byte[] packet = provider.readPacket();
@@ -358,55 +392,156 @@ public class DaedalusVpnService extends VpnService implements Runnable {
                 }
             }
         } catch (Exception e) {
-            MainActivity.getInstance().runOnUiThread(() ->
-                    new AlertDialog.Builder(MainActivity.getInstance())
-                            .setTitle(R.string.error_occurred)
-                            .setMessage(Logger.getExceptionMessage(e))
-                            .setPositiveButton(android.R.string.ok, (d, id) -> {
-                            })
-                            .show());
+            if (MainActivity.getInstance() != null && !MainActivity.getInstance().isFinishing()) {
+                MainActivity.getInstance().runOnUiThread(() -> {
+                    if (MainActivity.getInstance() != null && !MainActivity.getInstance().isFinishing()) {
+                        new AlertDialog.Builder(MainActivity.getInstance())
+                                .setTitle(R.string.error_occurred)
+                                .setMessage(Logger.getExceptionMessage(e))
+                                .setPositiveButton(android.R.string.ok, (d, id) -> {
+                                })
+                                .show();
+                    }
+                });
+            }
             Logger.logException(e);
         } finally {
             stopThread();
         }
     }
 
+
+    public class MDNSSetup {
+        private static final String TAG = "MDNSSetup";
+        private JmDNS jmdns;
+        private ConcurrentHashMap<String, String> localDomainMap = new ConcurrentHashMap<>();
+        private ExecutorService executorService = Executors.newSingleThreadExecutor();
+
+        public void setupMDNS() {
+            Log.d(TAG, "setupMDNS: Setting up mDNS");
+            executorService.execute(() -> {
+                try {
+                    InetAddress inetAddress = InetAddress.getByName("0.0.0.0");
+                    jmdns = JmDNS.create(inetAddress);
+
+                    jmdns.addServiceListener("_http._tcp.local.", new ServiceListener() {
+                        @Override
+                        public void serviceAdded(ServiceEvent event) {
+                            Log.d(TAG, "mDNS service added: " + event.getName());
+                            jmdns.requestServiceInfo(event.getType(), event.getName());
+                        }
+
+                        @Override
+                        public void serviceRemoved(ServiceEvent event) {
+                            Log.d(TAG, "mDNS service removed: " + event.getName());
+                            localDomainMap.remove(event.getInfo().getName());
+                        }
+
+                        @Override
+                        public void serviceResolved(ServiceEvent event) {
+                            Log.d(TAG, "mDNS service resolved: " + event.getName());
+                            String hostAddress = event.getInfo().getInetAddresses()[0].getHostAddress();
+                            localDomainMap.put(event.getInfo().getName(), hostAddress);
+                        }
+                    });
+                } catch (Exception e) {
+                    Log.e(TAG, "Error setting up mDNS: " + e.getMessage(), e);
+                }
+            });
+        }
+
+        // Remember to call this method when you're done with mDNS
+        public void shutdown() {
+            if (jmdns != null) {
+                try {
+                    jmdns.close();
+                } catch (Exception e) {
+                    Log.e(TAG, "Error closing JmDNS: " + e.getMessage(), e);
+                }
+            }
+            executorService.shutdown();
+        }
+    }
+
     private void handlePacket(byte[] packet) {
         try {
-            // Log packet received
-            org.itxtech.daedalus.server.Logger.log("Received packet: " + Arrays.toString(packet));
+            Logger.debug("Received packet: " + Arrays.toString(packet));
 
-            DnsMessage dnsMessage = new DnsMessage(packet);
+            if (packet.length < 28) {
+                Logger.debug("Packet too short to be a DNS message. Length: " + packet.length);
+                return;
+            }
+
+            ByteBuffer buffer = ByteBuffer.wrap(packet).order(ByteOrder.BIG_ENDIAN);
+            int version = (buffer.get(0) >> 4) & 0xF;
+
+            if (version != 4 && version != 6) {
+                Logger.debug("Not an IPv4 or IPv6 packet. Version: " + version);
+                return;
+            }
+
+            Logger.debug("IP Version: " + version);
+
+            byte[] dnsPacket;
+            if (version == 4) {
+                int protocol = buffer.get(9) & 0xFF;
+                if (protocol != 17) { // Not UDP
+                    Logger.debug("Not a UDP packet. Protocol: " + protocol);
+                    return;
+                }
+                dnsPacket = Arrays.copyOfRange(packet, 28, packet.length);
+                Logger.debug("IPv4 UDP packet detected.");
+            } else { // IPv6
+                int nextHeader = buffer.get(6);
+                if (nextHeader == 58) { // ICMPv6
+                    Logger.debug("Received an ICMPv6 packet. Skipping.");
+                    return;
+                }
+                if (nextHeader != 17) { // Not UDP
+                    Logger.debug("Not a UDP packet. Next header: " + nextHeader);
+                    return;
+                }
+                dnsPacket = Arrays.copyOfRange(packet, 48, packet.length);
+                Logger.debug("IPv6 UDP packet detected.");
+            }
+
+            processDnsPacket(dnsPacket);
+        } catch (Exception e) {
+            Logger.logException(e);
+        }
+    }
+
+    private void processDnsPacket(byte[] dnsPacket) {
+        try {
+            DnsMessage dnsMessage = new DnsMessage(dnsPacket);
             String queryDomain = dnsMessage.getQuestion().name.toString();
 
-            // Log the query domain
-            org.itxtech.daedalus.server.Logger.log("Query domain: " + queryDomain);
+            Logger.debug("Processing DNS packet. Query domain: " + queryDomain);
 
-            if (queryDomain.endsWith("gtblcl.com.")) {
-                org.itxtech.daedalus.server.Logger.log("Handling gtblcl.com domain.");
-                handleGtblclDomain(dnsMessage);
+            if (queryDomain.endsWith("mgocres.com.")) {
+                Logger.debug("Handling mgocres.com domain.");
+                handleMgocresDomain(dnsMessage);
             } else {
-                org.itxtech.daedalus.server.Logger.log("Forwarding packet to Cloudflare DNS.");
-                // Forward the DNS query to Cloudflare's DNS
-                provider.forwardPacket(CLOUDFLARE_DNS, DnsServer.DNS_SERVER_DEFAULT_PORT, packet);
+                Logger.debug("Forwarding packet to Cloudflare DNS.");
+                provider.forwardPacket(CLOUDFLARE_DNS, DnsServer.DNS_SERVER_DEFAULT_PORT, dnsPacket);
             }
         } catch (Exception e) {
             Logger.logException(e);
         }
     }
 
-    private void handleGtblclDomain(DnsMessage dnsMessage) {
+    private void handleMgocresDomain(DnsMessage dnsMessage) {
         try {
             String queryDomain = dnsMessage.getQuestion().name.toString();
-            String localDomain = queryDomain.replace(".gtblcl.com.", LOCAL_HOST_SUFFIX);
+            String localDomain = queryDomain.replace(".mgocres.com.", ".local");
 
             InetAddress localServerAddress;
             try {
-                org.itxtech.daedalus.server.Logger.log("Attempting to resolve " + localDomain + " using system resolver.");
+                org.itxtech.daedalus.server.  Logger.log("Attempting to resolve " + localDomain + " using system resolver.");
                 localServerAddress = MdnsResolver.systemResolve(localDomain);
-                org.itxtech.daedalus.server.Logger.log("Resolved " + localDomain + " to IP: " + localServerAddress.getHostAddress() + " using system resolver.");
+                org.itxtech.daedalus.server.  Logger.log("Resolved " + localDomain + " to IP: " + localServerAddress.getHostAddress() + " using system resolver.");
             } catch (Exception e) {
-                org.itxtech.daedalus.server.Logger.log("System resolver failed. Attempting to resolve " + localDomain + " using mDNS.");
+                org.itxtech.daedalus.server.  Logger.log("System resolver failed. Attempting to resolve " + localDomain + " using mDNS.");
                 localServerAddress = MdnsResolver.resolveMdnsName(localDomain);
                 org.itxtech.daedalus.server.Logger.log("Resolved " + localDomain + " to IP: " + localServerAddress.getHostAddress() + " using mDNS.");
             }
@@ -417,14 +552,101 @@ public class DaedalusVpnService extends VpnService implements Runnable {
                     new A(localServerAddress.getAddress())));
             byte[] response = builder.build().toArray();
 
-            // Log the response being sent
-            org.itxtech.daedalus.server.Logger.log("Sending response for " + queryDomain + " with IP: " + localServerAddress.getHostAddress());
+            org.itxtech.daedalus.server. Logger.log("Sending response for " + queryDomain + " with IP: " + localServerAddress.getHostAddress());
 
             provider.writePacket(response);
         } catch (Exception e) {
             Logger.logException(e);
         }
     }
+
+
+    private void handleFacebookDomain(DnsMessage dnsMessage) {
+        try {
+            String queryDomain = dnsMessage.getQuestion().name.toString();
+            String localDomain = queryDomain.replace(".mgcores.com.", LOCAL_HOST_SUFFIX);
+            org.itxtech.daedalus.server.Logger.log("LOCAL DOMAIN " + localDomain);
+
+            InetAddress localServerAddress;
+            try {
+                org.itxtech.daedalus.server.Logger.log("Attempting to resolve " + localDomain + " using system resolver.");
+                localServerAddress = MdnsResolver.systemResolve(localDomain);
+                org.itxtech.daedalus.server.  Logger.log("Resolved " + localDomain + " to IP: " + localServerAddress.getHostAddress() + " using system resolver.");
+            } catch (Exception e) {
+                org.itxtech.daedalus.server.   Logger.log("System resolver failed. Attempting to resolve " + localDomain + " using mDNS.");
+                localServerAddress = MdnsResolver.resolveMdnsName(localDomain);
+                org.itxtech.daedalus.server.  Logger.log("Resolved " + localDomain + " to IP: " + localServerAddress.getHostAddress() + " using mDNS.");
+            }
+
+            DnsMessage.Builder builder = dnsMessage.asBuilder();
+            builder.setQrFlag(true);
+            builder.addAnswer(new Record<>(dnsMessage.getQuestion().name, Record.TYPE.A, 1, 300,
+                    new A(localServerAddress.getAddress())));
+            byte[] response = builder.build().toArray();
+
+            // Log the response being sent
+            org.itxtech.daedalus.server.  Logger.log("Sending response for " + queryDomain + " with IP: " + localServerAddress.getHostAddress());
+
+            provider.writePacket(response);
+        } catch (Exception e) {
+            Logger.logException(e);
+        }
+    }
+
+//    private void handlePacket(byte[] packet) {
+//        try {
+//            // Log packet received
+//            org.itxtech.daedalus.server.Logger.log("Received packet: " + Arrays.toString(packet));
+//
+//            DnsMessage dnsMessage = new DnsMessage(packet);
+//            String queryDomain = dnsMessage.getQuestion().name.toString();
+//
+//            // Log the query domain
+//            org.itxtech.daedalus.server.Logger.log("Query domain: " + queryDomain);
+//
+//            if (queryDomain.endsWith("gtblcl.com.")) {
+//                org.itxtech.daedalus.server.Logger.log("Handling gtblcl.com domain.");
+//                handleGtblclDomain(dnsMessage);
+//            } else {
+//                org.itxtech.daedalus.server.Logger.log("Forwarding packet to Cloudflare DNS.");
+//                // Forward the DNS query to Cloudflare's DNS
+//                provider.forwardPacket(CLOUDFLARE_DNS, DnsServer.DNS_SERVER_DEFAULT_PORT, packet);
+//            }
+//        } catch (Exception e) {
+//            Logger.logException(e);
+//        }
+//    }
+//
+//    private void handleGtblclDomain(DnsMessage dnsMessage) {
+//        try {
+//            String queryDomain = dnsMessage.getQuestion().name.toString();
+//            String localDomain = queryDomain.replace(".gtblcl.com.", LOCAL_HOST_SUFFIX);
+//
+//            InetAddress localServerAddress;
+//            try {
+//                org.itxtech.daedalus.server.Logger.log("Attempting to resolve " + localDomain + " using system resolver.");
+//                localServerAddress = MdnsResolver.systemResolve(localDomain);
+//                org.itxtech.daedalus.server.Logger.log("Resolved " + localDomain + " to IP: " + localServerAddress.getHostAddress() + " using system resolver.");
+//            } catch (Exception e) {
+//                org.itxtech.daedalus.server.Logger.log("System resolver failed. Attempting to resolve " + localDomain + " using mDNS.");
+//                localServerAddress = MdnsResolver.resolveMdnsName(localDomain);
+//                org.itxtech.daedalus.server.Logger.log("Resolved " + localDomain + " to IP: " + localServerAddress.getHostAddress() + " using mDNS.");
+//            }
+//
+//            DnsMessage.Builder builder = dnsMessage.asBuilder();
+//            builder.setQrFlag(true);
+//            builder.addAnswer(new Record<>(dnsMessage.getQuestion().name, Record.TYPE.A, 1, 300,
+//                    new A(localServerAddress.getAddress())));
+//            byte[] response = builder.build().toArray();
+//
+//            // Log the response being sent
+//            org.itxtech.daedalus.server.Logger.log("Sending response for " + queryDomain + " with IP: " + localServerAddress.getHostAddress());
+//
+//            provider.writePacket(response);
+//        } catch (Exception e) {
+//            Logger.logException(e);
+//        }
+//    }
 
 
     public void providerLoopCallback() {

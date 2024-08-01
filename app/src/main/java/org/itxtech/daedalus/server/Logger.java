@@ -3,7 +3,7 @@ package org.itxtech.daedalus.server;
 import android.util.Log;
 
 public class Logger {
-    private static final String TAG = "SimpleVpnService";
+    private static final String TAG = "DaedalusVpnService";
 
     public static void log(String message) {
         Log.d(TAG, message);

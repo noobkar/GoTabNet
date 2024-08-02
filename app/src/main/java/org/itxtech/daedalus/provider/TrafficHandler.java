@@ -24,7 +24,7 @@ public class TrafficHandler {
             Log.d(TAG, "handleTraffic: Starting to handle traffic");
             try (FileInputStream inputStream = new FileInputStream(fileDescriptor);
                  FileOutputStream outputStream = new FileOutputStream(fileDescriptor)) {
-                
+
                 byte[] packet = new byte[MTU];
 
                 while (isRunning) {
